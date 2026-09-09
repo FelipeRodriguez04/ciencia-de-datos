@@ -63,7 +63,7 @@ services:
           tasks:
             tmp-dir: 
               path: /tmp/kestra-wd/tmp
-        url: http://localhost:8080
+          url: http://localhost:8080
     volumes:
       - kestra-storage:/app/storage
     depends_on:
