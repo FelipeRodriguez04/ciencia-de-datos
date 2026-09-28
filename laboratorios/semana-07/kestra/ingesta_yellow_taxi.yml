@@ -6,9 +6,14 @@ description: |
   desde 2025-01 hasta 2026-07 y los carga sin transformar
   en la capa Bronze de Snowflake.
 
-  La carga es idempotente por período:
-  antes de cargar un mes se eliminan los registros existentes
-  correspondientes a ese mismo período.
+  Los meses completos se omiten en ejecuciones posteriores.
+  Con force_reload se reemplaza cada mes dentro de una transacción.
+
+inputs:
+  - id: force_reload
+    type: BOOL
+    defaults: false
+    description: Recargar incluso los meses ya registrados en el manifiesto.
 
 concurrency:
   limit: 1
@@ -148,218 +153,237 @@ tasks:
 
     values: "{{ vars.periods }}"
 
-    concurrencyLimit: 1
+    concurrencyLimit: 2
 
     tasks:
 
-      # --------------------------------------------------------
-      # Descargar Parquet
-      # --------------------------------------------------------
-
-      - id: descargar
-        type: io.kestra.plugin.core.http.Download
-
-        uri: "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{{ taskrun.value }}.parquet"
-
-        retry:
-          type: constant
-          interval: PT15S
-          maxAttempt: 3
-
-
-      # --------------------------------------------------------
-      # Subir archivo al stage de Snowflake
-      # --------------------------------------------------------
-
-      - id: subir_stage
-        type: io.kestra.plugin.jdbc.snowflake.Upload
-
-        url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
-        username: "{{ envs.snowflake_user }}"
-        password: "{{ envs.snowflake_password }}"
-
-        role: "{{ envs.snowflake_role }}"
-        warehouse: "{{ envs.snowflake_warehouse }}"
-        database: "{{ envs.snowflake_database }}"
-        schema: "{{ envs.snowflake_schema }}"
-
-        from: "{{ outputs.descargar[taskrun.value].uri }}"
-
-        fileName: "yellow_tripdata_{{ taskrun.value }}.parquet"
-
-        stageName: "@YELLOW_TAXI_STAGE"
-
-        prefix: "{{ execution.id }}/{{ taskrun.value }}"
-
-        compress: false
-
-
-      # --------------------------------------------------------
-      # Reemplazar mes dentro de una transacción
-      # --------------------------------------------------------
-
-      - id: cargar_mes
+      - id: verificar_mes
         type: io.kestra.plugin.jdbc.snowflake.Query
-
         url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
         username: "{{ envs.snowflake_user }}"
         password: "{{ envs.snowflake_password }}"
-
         role: "{{ envs.snowflake_role }}"
         warehouse: "{{ envs.snowflake_warehouse }}"
         database: "{{ envs.snowflake_database }}"
         schema: "{{ envs.snowflake_schema }}"
-
+        fetchType: FETCH_ONE
         sql: |
-          EXECUTE IMMEDIATE
-          $$
-          DECLARE
+          SELECT IFF(COUNT(*) = 1 AND MIN(ROW_COUNT) > 0, 1, 0) AS ALREADY_LOADED
+          FROM YELLOW_TAXI_LOADS
+          WHERE SOURCE_PERIOD = TO_DATE('{{ taskrun.value }}-01');
 
-            month_rows NUMBER;
+      - id: si_falta_mes
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.force_reload or outputs.verificar_mes[taskrun.value].row.ALREADY_LOADED == 0 }}"
+        then:
+          # --------------------------------------------------------
+          # Descargar Parquet
+          # --------------------------------------------------------
 
-            empty_file EXCEPTION
-              (-20001, 'El archivo mensual no contiene filas');
+          - id: descargar
+            type: io.kestra.plugin.core.http.Download
 
-          BEGIN
+            uri: "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{{ parent.taskrun.value }}.parquet"
 
-            BEGIN TRANSACTION;
-
-
-            DELETE FROM RAW_YELLOW_TAXI
-
-            WHERE SOURCE_PERIOD =
-              TO_DATE('{{ taskrun.value }}-01');
-
-
-            COPY INTO RAW_YELLOW_TAXI
-            (
-              PAYLOAD,
-              SOURCE_FILE,
-              SOURCE_PERIOD,
-              SOURCE_ROW,
-              LOADED_AT,
-              FILE_CONTENT_KEY,
-              EXECUTION_ID
-            )
-
-            FROM
-            (
-              SELECT
-
-                $1,
-
-                'yellow_tripdata_{{ taskrun.value }}.parquet',
-
-                TO_DATE('{{ taskrun.value }}-01'),
-
-                METADATA$FILE_ROW_NUMBER,
-
-                METADATA$START_SCAN_TIME,
-
-                METADATA$FILE_CONTENT_KEY,
-
-                '{{ execution.id }}'
-
-              FROM
-                @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ taskrun.value }}/
-            )
-
-            FILES =
-              ('yellow_tripdata_{{ taskrun.value }}.parquet')
-
-            FILE_FORMAT =
-              (FORMAT_NAME = 'YELLOW_TAXI_PARQUET')
-
-            ON_ERROR = ABORT_STATEMENT
-
-            FORCE = TRUE;
+            retry:
+              type: constant
+              interval: PT15S
+              maxAttempt: 3
 
 
-            SELECT COUNT(*)
-            INTO :month_rows
+          # --------------------------------------------------------
+          # Subir archivo al stage de Snowflake
+          # --------------------------------------------------------
 
-            FROM RAW_YELLOW_TAXI
+          - id: subir_stage
+            type: io.kestra.plugin.jdbc.snowflake.Upload
 
-            WHERE SOURCE_PERIOD =
-              TO_DATE('{{ taskrun.value }}-01');
+            url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+            username: "{{ envs.snowflake_user }}"
+            password: "{{ envs.snowflake_password }}"
 
+            role: "{{ envs.snowflake_role }}"
+            warehouse: "{{ envs.snowflake_warehouse }}"
+            database: "{{ envs.snowflake_database }}"
+            schema: "{{ envs.snowflake_schema }}"
 
-            IF (month_rows = 0) THEN
+            from: "{{ outputs.descargar[parent.taskrun.value].uri }}"
 
-              RAISE empty_file;
+            fileName: "yellow_tripdata_{{ parent.taskrun.value }}.parquet"
 
-            END IF;
+            stageName: "@YELLOW_TAXI_STAGE"
 
+            prefix: "{{ execution.id }}/{{ parent.taskrun.value }}"
 
-            DELETE FROM YELLOW_TAXI_LOADS
-
-            WHERE SOURCE_PERIOD =
-              TO_DATE('{{ taskrun.value }}-01');
-
-
-            INSERT INTO YELLOW_TAXI_LOADS
-            (
-              SOURCE_PERIOD,
-              SOURCE_FILE,
-              ROW_COUNT,
-              LOADED_AT,
-              EXECUTION_ID
-            )
-
-            VALUES
-            (
-              TO_DATE('{{ taskrun.value }}-01'),
-
-              'yellow_tripdata_{{ taskrun.value }}.parquet',
-
-              :month_rows,
-
-              CURRENT_TIMESTAMP(),
-
-              '{{ execution.id }}'
-            );
+            compress: false
 
 
-            COMMIT;
+          # --------------------------------------------------------
+          # Reemplazar mes dentro de una transacción
+          # --------------------------------------------------------
+
+          - id: cargar_mes
+            type: io.kestra.plugin.jdbc.snowflake.Query
+
+            url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+            username: "{{ envs.snowflake_user }}"
+            password: "{{ envs.snowflake_password }}"
+
+            role: "{{ envs.snowflake_role }}"
+            warehouse: "{{ envs.snowflake_warehouse }}"
+            database: "{{ envs.snowflake_database }}"
+            schema: "{{ envs.snowflake_schema }}"
+
+            sql: |
+              EXECUTE IMMEDIATE
+              $$
+              DECLARE
+
+                month_rows NUMBER;
+
+                empty_file EXCEPTION
+                  (-20001, 'El archivo mensual no contiene filas');
+
+              BEGIN
+
+                BEGIN TRANSACTION;
 
 
-            RETURN
-              'Cargadas '
-              || month_rows
-              || ' filas de {{ taskrun.value }}';
+                DELETE FROM RAW_YELLOW_TAXI
+
+                WHERE SOURCE_PERIOD =
+                  TO_DATE('{{ parent.taskrun.value }}-01');
 
 
-          EXCEPTION
+                COPY INTO RAW_YELLOW_TAXI
+                (
+                  PAYLOAD,
+                  SOURCE_FILE,
+                  SOURCE_PERIOD,
+                  SOURCE_ROW,
+                  LOADED_AT,
+                  FILE_CONTENT_KEY,
+                  EXECUTION_ID
+                )
 
-            WHEN OTHER THEN
+                FROM
+                (
+                  SELECT
 
-              ROLLBACK;
+                    $1,
 
-              RAISE;
+                    'yellow_tripdata_{{ parent.taskrun.value }}.parquet',
 
-          END;
-          $$;
+                    TO_DATE('{{ parent.taskrun.value }}-01'),
+
+                    METADATA$FILE_ROW_NUMBER,
+
+                    METADATA$START_SCAN_TIME,
+
+                    METADATA$FILE_CONTENT_KEY,
+
+                    '{{ execution.id }}'
+
+                  FROM
+                    @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ parent.taskrun.value }}/
+                )
+
+                FILES =
+                  ('yellow_tripdata_{{ parent.taskrun.value }}.parquet')
+
+                FILE_FORMAT =
+                  (FORMAT_NAME = 'YELLOW_TAXI_PARQUET')
+
+                ON_ERROR = ABORT_STATEMENT
+
+                FORCE = TRUE;
 
 
-      # --------------------------------------------------------
-      # Eliminar archivo temporal del stage
-      # --------------------------------------------------------
+                SELECT COUNT(*)
+                INTO :month_rows
 
-      - id: limpiar_stage
-        type: io.kestra.plugin.jdbc.snowflake.Query
+                FROM RAW_YELLOW_TAXI
 
-        url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
-        username: "{{ envs.snowflake_user }}"
-        password: "{{ envs.snowflake_password }}"
+                WHERE SOURCE_PERIOD =
+                  TO_DATE('{{ parent.taskrun.value }}-01');
 
-        role: "{{ envs.snowflake_role }}"
-        warehouse: "{{ envs.snowflake_warehouse }}"
-        database: "{{ envs.snowflake_database }}"
-        schema: "{{ envs.snowflake_schema }}"
 
-        sql: |
-          REMOVE
-          @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ taskrun.value }}/;
+                IF (month_rows = 0) THEN
+
+                  RAISE empty_file;
+
+                END IF;
+
+
+                DELETE FROM YELLOW_TAXI_LOADS
+
+                WHERE SOURCE_PERIOD =
+                  TO_DATE('{{ parent.taskrun.value }}-01');
+
+
+                INSERT INTO YELLOW_TAXI_LOADS
+                (
+                  SOURCE_PERIOD,
+                  SOURCE_FILE,
+                  ROW_COUNT,
+                  LOADED_AT,
+                  EXECUTION_ID
+                )
+
+                VALUES
+                (
+                  TO_DATE('{{ parent.taskrun.value }}-01'),
+
+                  'yellow_tripdata_{{ parent.taskrun.value }}.parquet',
+
+                  :month_rows,
+
+                  CURRENT_TIMESTAMP(),
+
+                  '{{ execution.id }}'
+                );
+
+
+                COMMIT;
+
+
+                RETURN
+                  'Cargadas '
+                  || month_rows
+                  || ' filas de {{ parent.taskrun.value }}';
+
+
+              EXCEPTION
+
+                WHEN OTHER THEN
+
+                  ROLLBACK;
+
+                  RAISE;
+
+              END;
+              $$;
+
+
+          # --------------------------------------------------------
+          # Eliminar archivo temporal del stage
+          # --------------------------------------------------------
+
+          - id: limpiar_stage
+            type: io.kestra.plugin.jdbc.snowflake.Query
+
+            url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+            username: "{{ envs.snowflake_user }}"
+            password: "{{ envs.snowflake_password }}"
+
+            role: "{{ envs.snowflake_role }}"
+            warehouse: "{{ envs.snowflake_warehouse }}"
+            database: "{{ envs.snowflake_database }}"
+            schema: "{{ envs.snowflake_schema }}"
+
+            sql: |
+              REMOVE
+              @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ parent.taskrun.value }}/;
 
 
   # ============================================================

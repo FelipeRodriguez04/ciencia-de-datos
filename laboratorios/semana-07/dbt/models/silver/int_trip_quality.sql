@@ -1,4 +1,4 @@
-{{ config(materialized='view') }}
+{{ config(materialized='table') }}
 with checked as (
     select *,
         array_construct_compact(
