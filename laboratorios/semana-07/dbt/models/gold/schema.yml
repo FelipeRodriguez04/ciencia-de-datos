@@ -1,0 +1,96 @@
+version: 2
+models:
+  - name: dim_zone
+    description: Zonas oficiales TLC y fila -1 para ubicaciones desconocidas.
+    columns:
+      - name: zone_key
+        data_tests: [not_null, unique]
+  - name: dim_vendor
+    columns:
+      - name: vendor_key
+        data_tests: [not_null, unique]
+  - name: dim_rate
+    columns:
+      - name: rate_key
+        data_tests: [not_null, unique]
+  - name: dim_payment
+    columns:
+      - name: payment_key
+        data_tests: [not_null, unique]
+  - name: dim_date
+    columns:
+      - name: date_key
+        data_tests: [not_null, unique]
+  - name: dim_hour
+    columns:
+      - name: hour_key
+        data_tests: [not_null, unique]
+  - name: fct_yellow_trips
+    description: Una fila por viaje válido y único, tras deduplicar registros idénticos.
+    columns:
+      - name: trip_key
+        description: Clave de la tabla de hechos.
+        data_tests: [not_null, unique]
+      - name: pickup_date_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: dropoff_date_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: pickup_hour_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_hour')
+                field: hour_key
+      - name: dropoff_hour_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_hour')
+                field: hour_key
+      - name: pickup_zone_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_zone')
+                field: zone_key
+      - name: dropoff_zone_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_zone')
+                field: zone_key
+      - name: vendor_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_vendor')
+                field: vendor_key
+      - name: rate_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_rate')
+                field: rate_key
+      - name: payment_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_payment')
+                field: payment_key

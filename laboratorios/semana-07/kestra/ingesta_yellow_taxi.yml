@@ -1,0 +1,402 @@
+id: ingesta_yellow_taxi
+namespace: laboratorio.semana07
+
+description: |
+  Descarga los 19 archivos Parquet de NYC Yellow Taxi disponibles
+  desde 2025-01 hasta 2026-07 y los carga sin transformar
+  en la capa Bronze de Snowflake.
+
+  La carga es idempotente por período:
+  antes de cargar un mes se eliminan los registros existentes
+  correspondientes a ese mismo período.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+variables:
+  periods:
+    - "2025-01"
+    - "2025-02"
+    - "2025-03"
+    - "2025-04"
+    - "2025-05"
+    - "2025-06"
+    - "2025-07"
+    - "2025-08"
+    - "2025-09"
+    - "2025-10"
+    - "2025-11"
+    - "2025-12"
+    - "2026-01"
+    - "2026-02"
+    - "2026-03"
+    - "2026-04"
+    - "2026-05"
+    - "2026-06"
+    - "2026-07"
+
+
+tasks:
+
+  # ============================================================
+  # 1. CREAR WAREHOUSE
+  # ============================================================
+
+  - id: crear_warehouse
+    type: io.kestra.plugin.jdbc.snowflake.Query
+
+    url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+    username: "{{ envs.snowflake_user }}"
+    password: "{{ envs.snowflake_password }}"
+    role: "{{ envs.snowflake_role }}"
+
+    sql: |
+      CREATE WAREHOUSE IF NOT EXISTS {{ envs.snowflake_warehouse }}
+        WAREHOUSE_SIZE = 'XSMALL'
+        AUTO_SUSPEND = 60
+        AUTO_RESUME = TRUE
+        INITIALLY_SUSPENDED = TRUE;
+
+
+  # ============================================================
+  # 2. CREAR DATABASE
+  # ============================================================
+
+  - id: crear_database
+    type: io.kestra.plugin.jdbc.snowflake.Query
+
+    url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+    username: "{{ envs.snowflake_user }}"
+    password: "{{ envs.snowflake_password }}"
+    role: "{{ envs.snowflake_role }}"
+
+    sql: |
+      CREATE DATABASE IF NOT EXISTS {{ envs.snowflake_database }};
+
+
+  # ============================================================
+  # 3. CREAR SCHEMA BRONZE
+  # ============================================================
+
+  - id: crear_schema
+    type: io.kestra.plugin.jdbc.snowflake.Query
+
+    url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+    username: "{{ envs.snowflake_user }}"
+    password: "{{ envs.snowflake_password }}"
+    role: "{{ envs.snowflake_role }}"
+    warehouse: "{{ envs.snowflake_warehouse }}"
+
+    sql: |
+      CREATE SCHEMA IF NOT EXISTS
+        {{ envs.snowflake_database }}.{{ envs.snowflake_schema }};
+
+
+  # ============================================================
+  # 4. PREPARAR OBJETOS DE BRONZE
+  # ============================================================
+
+  - id: preparar_bronze
+    type: io.kestra.plugin.jdbc.snowflake.Queries
+
+    url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+    username: "{{ envs.snowflake_user }}"
+    password: "{{ envs.snowflake_password }}"
+
+    role: "{{ envs.snowflake_role }}"
+    warehouse: "{{ envs.snowflake_warehouse }}"
+    database: "{{ envs.snowflake_database }}"
+    schema: "{{ envs.snowflake_schema }}"
+
+    transaction: false
+
+    sql: |
+
+      CREATE FILE FORMAT IF NOT EXISTS YELLOW_TAXI_PARQUET
+        TYPE = PARQUET
+        USE_LOGICAL_TYPE = TRUE
+        BINARY_AS_TEXT = FALSE;
+
+      CREATE STAGE IF NOT EXISTS YELLOW_TAXI_STAGE;
+
+      CREATE TABLE IF NOT EXISTS RAW_YELLOW_TAXI (
+        PAYLOAD VARIANT NOT NULL,
+        SOURCE_FILE VARCHAR NOT NULL,
+        SOURCE_PERIOD DATE NOT NULL,
+        SOURCE_ROW NUMBER NOT NULL,
+        LOADED_AT TIMESTAMP_LTZ NOT NULL,
+        FILE_CONTENT_KEY VARCHAR,
+        EXECUTION_ID VARCHAR NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS YELLOW_TAXI_LOADS (
+        SOURCE_PERIOD DATE NOT NULL,
+        SOURCE_FILE VARCHAR NOT NULL,
+        ROW_COUNT NUMBER NOT NULL,
+        LOADED_AT TIMESTAMP_LTZ NOT NULL,
+        EXECUTION_ID VARCHAR NOT NULL
+      );
+
+
+  # ============================================================
+  # 5. PROCESAR CADA MES
+  # ============================================================
+
+  - id: meses
+    type: io.kestra.plugin.core.flow.ForEach
+
+    values: "{{ vars.periods }}"
+
+    concurrencyLimit: 1
+
+    tasks:
+
+      # --------------------------------------------------------
+      # Descargar Parquet
+      # --------------------------------------------------------
+
+      - id: descargar
+        type: io.kestra.plugin.core.http.Download
+
+        uri: "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{{ taskrun.value }}.parquet"
+
+        retry:
+          type: constant
+          interval: PT15S
+          maxAttempt: 3
+
+
+      # --------------------------------------------------------
+      # Subir archivo al stage de Snowflake
+      # --------------------------------------------------------
+
+      - id: subir_stage
+        type: io.kestra.plugin.jdbc.snowflake.Upload
+
+        url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ envs.snowflake_password }}"
+
+        role: "{{ envs.snowflake_role }}"
+        warehouse: "{{ envs.snowflake_warehouse }}"
+        database: "{{ envs.snowflake_database }}"
+        schema: "{{ envs.snowflake_schema }}"
+
+        from: "{{ outputs.descargar[taskrun.value].uri }}"
+
+        fileName: "yellow_tripdata_{{ taskrun.value }}.parquet"
+
+        stageName: "@YELLOW_TAXI_STAGE"
+
+        prefix: "{{ execution.id }}/{{ taskrun.value }}"
+
+        compress: false
+
+
+      # --------------------------------------------------------
+      # Reemplazar mes dentro de una transacción
+      # --------------------------------------------------------
+
+      - id: cargar_mes
+        type: io.kestra.plugin.jdbc.snowflake.Query
+
+        url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ envs.snowflake_password }}"
+
+        role: "{{ envs.snowflake_role }}"
+        warehouse: "{{ envs.snowflake_warehouse }}"
+        database: "{{ envs.snowflake_database }}"
+        schema: "{{ envs.snowflake_schema }}"
+
+        sql: |
+          EXECUTE IMMEDIATE
+          $$
+          DECLARE
+
+            month_rows NUMBER;
+
+            empty_file EXCEPTION
+              (-20001, 'El archivo mensual no contiene filas');
+
+          BEGIN
+
+            BEGIN TRANSACTION;
+
+
+            DELETE FROM RAW_YELLOW_TAXI
+
+            WHERE SOURCE_PERIOD =
+              TO_DATE('{{ taskrun.value }}-01');
+
+
+            COPY INTO RAW_YELLOW_TAXI
+            (
+              PAYLOAD,
+              SOURCE_FILE,
+              SOURCE_PERIOD,
+              SOURCE_ROW,
+              LOADED_AT,
+              FILE_CONTENT_KEY,
+              EXECUTION_ID
+            )
+
+            FROM
+            (
+              SELECT
+
+                $1,
+
+                'yellow_tripdata_{{ taskrun.value }}.parquet',
+
+                TO_DATE('{{ taskrun.value }}-01'),
+
+                METADATA$FILE_ROW_NUMBER,
+
+                METADATA$START_SCAN_TIME,
+
+                METADATA$FILE_CONTENT_KEY,
+
+                '{{ execution.id }}'
+
+              FROM
+                @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ taskrun.value }}/
+            )
+
+            FILES =
+              ('yellow_tripdata_{{ taskrun.value }}.parquet')
+
+            FILE_FORMAT =
+              (FORMAT_NAME = 'YELLOW_TAXI_PARQUET')
+
+            ON_ERROR = ABORT_STATEMENT
+
+            FORCE = TRUE;
+
+
+            SELECT COUNT(*)
+            INTO :month_rows
+
+            FROM RAW_YELLOW_TAXI
+
+            WHERE SOURCE_PERIOD =
+              TO_DATE('{{ taskrun.value }}-01');
+
+
+            IF (month_rows = 0) THEN
+
+              RAISE empty_file;
+
+            END IF;
+
+
+            DELETE FROM YELLOW_TAXI_LOADS
+
+            WHERE SOURCE_PERIOD =
+              TO_DATE('{{ taskrun.value }}-01');
+
+
+            INSERT INTO YELLOW_TAXI_LOADS
+            (
+              SOURCE_PERIOD,
+              SOURCE_FILE,
+              ROW_COUNT,
+              LOADED_AT,
+              EXECUTION_ID
+            )
+
+            VALUES
+            (
+              TO_DATE('{{ taskrun.value }}-01'),
+
+              'yellow_tripdata_{{ taskrun.value }}.parquet',
+
+              :month_rows,
+
+              CURRENT_TIMESTAMP(),
+
+              '{{ execution.id }}'
+            );
+
+
+            COMMIT;
+
+
+            RETURN
+              'Cargadas '
+              || month_rows
+              || ' filas de {{ taskrun.value }}';
+
+
+          EXCEPTION
+
+            WHEN OTHER THEN
+
+              ROLLBACK;
+
+              RAISE;
+
+          END;
+          $$;
+
+
+      # --------------------------------------------------------
+      # Eliminar archivo temporal del stage
+      # --------------------------------------------------------
+
+      - id: limpiar_stage
+        type: io.kestra.plugin.jdbc.snowflake.Query
+
+        url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ envs.snowflake_password }}"
+
+        role: "{{ envs.snowflake_role }}"
+        warehouse: "{{ envs.snowflake_warehouse }}"
+        database: "{{ envs.snowflake_database }}"
+        schema: "{{ envs.snowflake_schema }}"
+
+        sql: |
+          REMOVE
+          @YELLOW_TAXI_STAGE/{{ execution.id }}/{{ taskrun.value }}/;
+
+
+  # ============================================================
+  # 6. VALIDAR LOS 19 MESES
+  # ============================================================
+
+  - id: validar_19_meses
+    type: io.kestra.plugin.jdbc.snowflake.Query
+
+    url: "jdbc:snowflake://{{ envs.snowflake_account }}.snowflakecomputing.com"
+    username: "{{ envs.snowflake_user }}"
+    password: "{{ envs.snowflake_password }}"
+
+    role: "{{ envs.snowflake_role }}"
+    warehouse: "{{ envs.snowflake_warehouse }}"
+    database: "{{ envs.snowflake_database }}"
+    schema: "{{ envs.snowflake_schema }}"
+
+    fetchType: FETCH_ONE
+
+    sql: |
+      SELECT
+
+        COUNT(*) AS MONTHS_LOADED,
+
+        SUM(ROW_COUNT) AS TOTAL_ROWS,
+
+        1 / IFF(
+          COUNT(*) = 19
+          AND COUNT(DISTINCT SOURCE_PERIOD) = 19
+          AND MIN(ROW_COUNT) > 0,
+          1,
+          0
+        ) AS COMPLETENESS_CHECK
+
+      FROM YELLOW_TAXI_LOADS
+
+      WHERE SOURCE_PERIOD
+        BETWEEN '2025-01-01'::DATE
+        AND '2026-07-01'::DATE;

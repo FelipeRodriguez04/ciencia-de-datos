@@ -1,0 +1,26 @@
+name: yellow_taxi_lab
+version: '1.0.0'
+config-version: 2
+profile: yellow_taxi_lab
+model-paths: [models]
+seed-paths: [seeds]
+test-paths: [tests]
+macro-paths: [macros]
+clean-targets: [target, dbt_packages]
+models:
+  yellow_taxi_lab:
+    bronze:
+      +schema: BRONZE
+      +materialized: view
+    silver:
+      +schema: SILVER
+      +materialized: table
+    gold:
+      +schema: GOLD
+      +materialized: table
+seeds:
+  yellow_taxi_lab:
+    +schema: SILVER
+    taxi_zones:
+      +column_types:
+        location_id: integer

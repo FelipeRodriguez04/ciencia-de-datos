@@ -1,0 +1,26 @@
+version: 2
+sources:
+  - name: tlc
+    database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+    schema: "{{ env_var('SNOWFLAKE_BRONZE_SCHEMA', 'BRONZE') }}"
+    tables:
+      - name: raw_yellow_taxi
+        identifier: RAW_YELLOW_TAXI
+        columns:
+          - name: payload
+            data_tests: [not_null]
+          - name: source_file
+            data_tests: [not_null]
+          - name: source_period
+            data_tests: [not_null]
+          - name: source_row
+            data_tests: [not_null]
+          - name: loaded_at
+            data_tests: [not_null]
+      - name: yellow_taxi_loads
+        identifier: YELLOW_TAXI_LOADS
+        columns:
+          - name: source_period
+            data_tests: [not_null, unique]
+          - name: source_file
+            data_tests: [not_null, unique]
